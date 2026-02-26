@@ -12,11 +12,11 @@
 #define WIFI_PASSWORD "pskrn2002"
 
 // ================= FIREBASE =================
-#define API_KEY "AIzaSyBlGBKv5CNeksCADMZbbyumtBIlv-Lq-m4"
-#define DATABASE_URL "https://pillmate-9955d-default-rtdb.firebaseio.com/"
+#define API_KEY ""
+#define DATABASE_URL ""
 #define USER_EMAIL "palshital11@gmail.com"
 #define USER_PASSWORD "Shitalpal"
-#define USER_UID "ExZ0LPfeDLOsKgVatHyANr1A8mn2"
+#define USER_UID ""
 
 FirebaseData fbdo;
 FirebaseAuth auth;
