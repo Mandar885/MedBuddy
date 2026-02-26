@@ -1,0 +1,297 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================= OLED CONFIG =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define I2C_SDA 23
+#define I2C_SCL 16 // RX2 Pin
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= WIFI =================
+#define WIFI_SSID "WiFi Name"
+#define WIFI_PASSWORD "WiFi Password"
+
+// ================= FIREBASE =================
+#define API_KEY ""
+#define DATABASE_URL ""
+
+#define USER_EMAIL ""
+#define USER_PASSWORD ""
+#define USER_UID ""
+
+// ================= PINS =================
+#define LED_PIN 15
+#define BUZZER_PIN 4
+#define VALIDATE_BUTTON 5
+
+// ================= STEPPERS =================
+#define C1_IN1 18
+#define C1_IN2 19
+#define C1_IN3 21
+#define C1_IN4 22
+
+#define C2_IN1 13
+#define C2_IN2 12
+#define C2_IN3 14
+#define C2_IN4 27
+
+#define C3_IN1 26
+#define C3_IN2 25
+#define C3_IN3 33
+#define C3_IN4 32
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+int stepSequence[4][4] = {
+  {1, 0, 0, 0},
+  {0, 1, 0, 0},
+  {0, 0, 1, 0},
+  {0, 0, 0, 1}
+};
+
+int currentStep = 0;
+
+// ================= GLOBALS =================
+unsigned long long nextDoseTime = 0;
+String nextCylinder = "";
+String nextMedicineName = "";
+String nextCourseName = "";
+
+unsigned long lastFirebaseCheck = 0;
+const unsigned long firebaseInterval = 10000;
+
+bool alertActive = false;
+bool doseProcessed = false;
+unsigned long alertStartMillis = 0;
+unsigned long long lastHandledDoseTime = 0;
+const unsigned long validationWindow = 120000;
+
+// ====================================================
+// OLED HELPER
+// ====================================================
+void displayMessage(String line1, String line2 = "", String line3 = "", int textSize = 1) {
+  display.clearDisplay();
+  display.setTextSize(textSize);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(line1);
+  if (line2 != "") display.println(line2);
+  if (line3 != "") display.println(line3);
+  display.display();
+}
+
+// ====================================================
+// STEPPER ROTATION
+// ====================================================
+void rotateStepper(int in1, int in2, int in3, int in4, int steps) {
+  Serial.println("🔄 Rotating Stepper...");
+  displayMessage("Dispensing...", "Cylinder: " + nextCylinder);
+
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(in1, stepSequence[currentStep][0]);
+    digitalWrite(in2, stepSequence[currentStep][1]);
+    digitalWrite(in3, stepSequence[currentStep][2]);
+    digitalWrite(in4, stepSequence[currentStep][3]);
+    currentStep++;
+    if (currentStep >= 4) currentStep = 0;
+    delay(3);
+  }
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+}
+
+// ====================================================
+// UPDATE STATUS + HISTORY + SMART COMPLETION
+// ====================================================
+void updateDoseStatus(String status) {
+  unsigned long long validatedAt = (unsigned long long)time(nullptr) * 1000ULL;
+  String basePath = "users/" + String(USER_UID) + "/cylinders/" + nextCylinder;
+  String schedulePath = basePath + "/schedule/" + String(nextDoseTime);
+
+  // 1. Update Schedule
+  FirebaseJson updateJson;
+  updateJson.set("status", status);
+  updateJson.set("validatedAt", validatedAt);
+  updateJson.set("source", "HARDWARE");
+  Firebase.RTDB.updateNode(&fbdo, schedulePath, &updateJson);
+  Serial.println("Schedule Updated -> " + status);
+  displayMessage("Status Updated", status);
+
+  // 2. Write History
+  FirebaseJson historyJson;
+  historyJson.set("cylinder", nextCylinder);
+  historyJson.set("courseName", nextCourseName);
+  historyJson.set("medicineName", nextMedicineName);
+  historyJson.set("doseTime", nextDoseTime);
+  historyJson.set("status", status);
+  historyJson.set("validatedAt", validatedAt);
+  Firebase.RTDB.pushJSON(&fbdo, "users/" + String(USER_UID) + "/doseHistory", &historyJson);
+
+  // 3. Decrement & Rotate if Taken
+  if (status == "TAKEN") {
+    int doseAmount = 0, remaining = 0;
+    Firebase.RTDB.getInt(&fbdo, basePath + "/doseAmount");
+    doseAmount = fbdo.intData();
+    Firebase.RTDB.getInt(&fbdo, basePath + "/remainingPillCount");
+    remaining = fbdo.intData();
+
+    remaining -= doseAmount;
+    if (remaining < 0) remaining = 0;
+    Firebase.RTDB.setInt(&fbdo, basePath + "/remainingPillCount", remaining);
+
+    if (nextCylinder == "C1") rotateStepper(C1_IN1, C1_IN2, C1_IN3, C1_IN4, 2048);
+    else if (nextCylinder == "C2") rotateStepper(C2_IN1, C2_IN2, C2_IN3, C2_IN4, 2048);
+    else if (nextCylinder == "C3") rotateStepper(C3_IN1, C3_IN2, C3_IN3, C3_IN4, 2048);
+  }
+
+  // 4. Smart Completion Check (Delete if no PENDING left)
+  bool hasPending = false;
+  if (Firebase.RTDB.getJSON(&fbdo, basePath + "/schedule")) {
+    FirebaseJson &json = fbdo.jsonObject();
+    size_t count = json.iteratorBegin();
+    for (size_t i = 0; i < count; i++) {
+      String key, value; int type;
+      json.iteratorGet(i, type, key, value);
+      FirebaseJsonData statusData;
+      json.get(statusData, key + "/status");
+      if (statusData.success && statusData.to<String>() == "PENDING") {
+        hasPending = true;
+        break;
+      }
+    }
+    json.iteratorEnd();
+  }
+
+  if (!hasPending) {
+    Serial.println("All doses completed. Deleting Cylinder.");
+    displayMessage("Course Finished", "Deleting " + nextCylinder);
+    Firebase.RTDB.setBool(&fbdo, basePath + "/completed", true);
+    Firebase.RTDB.deleteNode(&fbdo, basePath);
+    delay(2000);
+  }
+}
+
+// ====================================================
+// CORE FUNCTIONS (WiFi, Time, Firebase)
+// ====================================================
+void connectWiFi() {
+  displayMessage("Connecting WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  displayMessage("WiFi Connected!", WiFi.localIP().toString());
+  delay(1000);
+}
+
+void initTime() {
+  displayMessage("Syncing Time...");
+  configTime(19800, 0, "pool.ntp.org");
+  while (time(nullptr) < 100000) { delay(500); }
+  displayMessage("Time Synced!");
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  displayMessage("Firebase Auth...");
+  while (auth.token.uid == "") { delay(300); }
+  displayMessage("Authenticated!");
+}
+
+void checkCylinder(String cylinderName) {
+  String path = "users/" + String(USER_UID) + "/cylinders/" + cylinderName;
+  if (!Firebase.RTDB.getJSON(&fbdo, path + "/schedule")) return;
+  FirebaseJson &json = fbdo.jsonObject();
+  size_t count = json.iteratorBegin();
+  for (size_t i = 0; i < count; i++) {
+    String key, value; int type;
+    json.iteratorGet(i, type, key, value);
+    unsigned long long doseTime = strtoull(key.c_str(), NULL, 10);
+    FirebaseJsonData statusData;
+    json.get(statusData, key + "/status");
+    if (statusData.success && statusData.to<String>() == "PENDING") {
+      if (nextDoseTime == 0 || doseTime < nextDoseTime) {
+        nextDoseTime = doseTime;
+        nextCylinder = cylinderName;
+        Firebase.RTDB.getString(&fbdo, path + "/medicineName");
+        nextMedicineName = fbdo.stringData();
+        Firebase.RTDB.getString(&fbdo, path + "/courseName");
+        nextCourseName = fbdo.stringData();
+      }
+    }
+  }
+  json.iteratorEnd();
+}
+
+void checkNextDose() {
+  nextDoseTime = 0;
+  checkCylinder("C1"); checkCylinder("C2"); checkCylinder("C3");
+  if (nextDoseTime == 0) {
+    displayMessage("NO UPCOMING DOSE", "System Ready");
+    return;
+  }
+  time_t doseSecs = (time_t)(nextDoseTime / 1000ULL);
+  struct tm timeinfo; localtime_r(&doseSecs, &timeinfo);
+  char tStr[10]; sprintf(tStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  displayMessage("NEXT DOSE:", String(tStr) + " (" + nextCylinder + ")", nextMedicineName);
+}
+
+void handleAlert() {
+  unsigned long long now = (unsigned long long)time(nullptr) * 1000ULL;
+  if (!alertActive && nextDoseTime != 0 && nextDoseTime != lastHandledDoseTime && now >= nextDoseTime) {
+    alertActive = true; doseProcessed = false; alertStartMillis = millis();
+    digitalWrite(LED_PIN, HIGH); digitalWrite(BUZZER_PIN, HIGH);
+  }
+  if (alertActive && !doseProcessed) {
+    displayMessage("!!! TAKE PILL !!!", nextMedicineName, "Cylinder: " + nextCylinder);
+    if (digitalRead(VALIDATE_BUTTON) == LOW) {
+      digitalWrite(LED_PIN, LOW); digitalWrite(BUZZER_PIN, LOW);
+      updateDoseStatus("TAKEN");
+      lastHandledDoseTime = nextDoseTime; doseProcessed = true; alertActive = false;
+    }
+    if (millis() - alertStartMillis >= validationWindow) {
+      digitalWrite(LED_PIN, LOW); digitalWrite(BUZZER_PIN, LOW);
+      updateDoseStatus("MISSED");
+      lastHandledDoseTime = nextDoseTime; doseProcessed = true; alertActive = false;
+    }
+  }
+}
+
+// ====================================================
+// SETUP & LOOP
+// ====================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
+  display.clearDisplay();
+ 
+  pinMode(C1_IN1, OUTPUT); pinMode(C1_IN2, OUTPUT); pinMode(C1_IN3, OUTPUT); pinMode(C1_IN4, OUTPUT);
+  pinMode(C2_IN1, OUTPUT); pinMode(C2_IN2, OUTPUT); pinMode(C2_IN3, OUTPUT); pinMode(C2_IN4, OUTPUT);
+  pinMode(C3_IN1, OUTPUT); pinMode(C3_IN2, OUTPUT); pinMode(C3_IN3, OUTPUT); pinMode(C3_IN4, OUTPUT);
+  pinMode(LED_PIN, OUTPUT); pinMode(BUZZER_PIN, OUTPUT); pinMode(VALIDATE_BUTTON, INPUT_PULLUP);
+
+  connectWiFi();
+  initTime();
+  initFirebase();
+}
+
+void loop() {
+  if (!alertActive && millis() - lastFirebaseCheck > firebaseInterval) {
+    lastFirebaseCheck = millis();
+    if (Firebase.ready()) checkNextDose();
+  }
+  handleAlert();
+}
