@@ -1,0 +1,66 @@
+DB Structure
+
+users
+   uid
+      profile
+         name
+         email
+         caregiverContact
+
+      cylinders
+         C1
+            courseName: "Post Surgery Recovery"
+            medicineName: "Amoxicillin"
+            frequency: 3
+            duration: 5
+            doseAmount: 1
+            startTime: 1708252200000
+            totalPillCount: 15
+            remainingPillCount: 12
+            createdAt: 1708200000000
+
+            schedule
+               1708252200000
+                  status: "TAKEN"        // PENDING | TAKEN | MISSED
+                  validatedAt: 1708252250000
+                  source: "HARDWARE"     // HARDWARE | APP | SYSTEM
+
+               1708338600000
+                  status: "PENDING"
+                  validatedAt: 0
+                  source: ""
+
+         C2
+            courseName: "Post Surgery Recovery"
+            medicineName: "Ibuprofen"
+            frequency: 2
+            duration: 5
+            doseAmount: 1
+            startTime: 1708252200000
+            totalPillCount: 10
+            remainingPillCount: 8
+            createdAt: 1708200000000
+
+            schedule
+               1708295400000
+                  status: "MISSED"
+                  validatedAt: 1708296000000
+                  source: "HARDWARE"
+
+      safety
+         fall
+            active: false
+            detectedAt: 0
+            resolvedAt: 0
+            source: ""           // WEARABLE
+
+         boundary
+            active: false
+            beaconId: ""
+            detectedAt: 0
+            resolvedAt: 0
+            source: ""           // WEARABLE
+
+      liveTracking
+         currentBeacon: "ROOM_A"
+         lastUpdated: 1708252200000

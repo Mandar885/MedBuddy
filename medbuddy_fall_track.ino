@@ -1,0 +1,282 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <Wire.h>
+#include <math.h>
+#include <time.h>
+
+// ================= WIFI =================
+#define WIFI_SSID "GalaxyM02f06f"
+#define WIFI_PASSWORD "pskrn2002"
+
+// ================= FIREBASE =================
+#define API_KEY "AIzaSyBlGBKv5CNeksCADMZbbyumtBIlv-Lq-m4"
+#define DATABASE_URL "https://pillmate-9955d-default-rtdb.firebaseio.com/"
+#define USER_EMAIL "palshital11@gmail.com"
+#define USER_PASSWORD "Shitalpal"
+#define USER_UID "ExZ0LPfeDLOsKgVatHyANr1A8mn2"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================= BLE =================
+BLEScan* pBLEScan;
+int scanTime = 1;                      // 1 sec scan
+unsigned long lastBLEScan = 0;
+const unsigned long BLE_INTERVAL = 5000;
+
+String nearestBeacon = "";
+int strongestRSSI = -999;
+bool boundaryCurrentlyActive = false;
+
+// ================= MPU =================
+#define MPU_ADDR 0x68
+
+float FREE_FALL_THRESHOLD = 0.6;
+float IMPACT_THRESHOLD    = 2.0;
+float GYRO_THRESHOLD      = 200.0;
+
+bool freeFallDetected = false;
+bool fallAlreadyActive = false;
+unsigned long freeFallTime = 0;
+
+unsigned long lastMPURead = 0;
+const unsigned long MPU_INTERVAL = 60;   // ~16Hz
+
+// ====================================================
+// WIFI
+// ====================================================
+void connectWiFi() {
+  Serial.println("📶 Connecting WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ WiFi Connected");
+}
+
+// ====================================================
+// FIREBASE
+// ====================================================
+void initFirebase() {
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  unsigned long startTime = millis();
+  while (auth.token.uid == "" && millis() - startTime < 10000) {
+    delay(200);
+  }
+
+  if (auth.token.uid != "")
+    Serial.println("✅ Firebase Ready");
+  else
+    Serial.println("❌ Firebase Auth Failed");
+}
+
+// ====================================================
+// TIME
+// ====================================================
+void initTime() {
+  configTime(19800, 0, "pool.ntp.org");
+  unsigned long start = millis();
+  while (time(nullptr) < 100000 && millis() - start < 10000) {
+    delay(200);
+  }
+  Serial.println("⏱ Time Synced");
+}
+
+// ====================================================
+// MPU INIT
+// ====================================================
+void initMPU() {
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+
+  Serial.println("🧠 MPU Initialized");
+}
+
+// ====================================================
+// FALL DETECTION
+// ====================================================
+void detectFall(unsigned long long timestamp) {
+
+  int16_t AccX, AccY, AccZ;
+  int16_t GyroX, GyroY, GyroZ;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+
+  if (Wire.requestFrom(MPU_ADDR, 14, true) != 14)
+    return;
+
+  AccX = Wire.read() << 8 | Wire.read();
+  AccY = Wire.read() << 8 | Wire.read();
+  AccZ = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read();
+  GyroX = Wire.read() << 8 | Wire.read();
+  GyroY = Wire.read() << 8 | Wire.read();
+  GyroZ = Wire.read() << 8 | Wire.read();
+
+  float Ax = AccX / 16384.0;
+  float Ay = AccY / 16384.0;
+  float Az = AccZ / 16384.0;
+
+  float Gx = GyroX / 131.0;
+  float Gy = GyroY / 131.0;
+  float Gz = GyroZ / 131.0;
+
+  float accelMagnitude = sqrt(Ax*Ax + Ay*Ay + Az*Az);
+  float gyroMagnitude  = sqrt(Gx*Gx + Gy*Gy + Gz*Gz);
+
+  if (accelMagnitude < FREE_FALL_THRESHOLD) {
+    freeFallDetected = true;
+    freeFallTime = millis();
+  }
+
+  if (freeFallDetected &&
+      accelMagnitude > IMPACT_THRESHOLD &&
+      gyroMagnitude > GYRO_THRESHOLD &&
+      millis() - freeFallTime < 1000) {
+
+    if (!fallAlreadyActive && Firebase.ready()) {
+
+      Serial.println("🚨 FALL CONFIRMED");
+
+      FirebaseJson json;
+      json.set("active", true);
+      json.set("detectedAt", timestamp);
+      json.set("resolvedAt", 0);
+      json.set("source", "WEARABLE");
+
+      Firebase.RTDB.setJSON(
+        &fbdo,
+        "users/" + String(USER_UID) + "/safety/fall",
+        &json
+      );
+
+      fallAlreadyActive = true;
+    }
+
+    freeFallDetected = false;
+  }
+
+  if (freeFallDetected && millis() - freeFallTime > 1000)
+    freeFallDetected = false;
+}
+
+// ====================================================
+// BLE SCAN
+// ====================================================
+void scanBeacons() {
+
+  nearestBeacon = "";
+  strongestRSSI = -999;
+
+  Serial.println("🔎 Scanning BLE...");
+
+  BLEScanResults results = pBLEScan->start(scanTime, false);
+
+  for (int i = 0; i < results.getCount(); i++) {
+
+    BLEAdvertisedDevice device = results.getDevice(i);
+    String name = device.getName().c_str();
+    int rssi = device.getRSSI();
+
+    if (name == "B1" || name == "B2" ||
+        name == "B3" || name == "B4") {
+
+      if (rssi > strongestRSSI) {
+        strongestRSSI = rssi;
+        nearestBeacon = name;
+      }
+    }
+  }
+
+  pBLEScan->clearResults();
+
+  if (nearestBeacon != "")
+    Serial.println("📡 Nearest: " + nearestBeacon);
+}
+
+// ====================================================
+// FIREBASE LOCATION UPDATE
+// ====================================================
+void updateLiveTracking(unsigned long long timestamp) {
+
+  FirebaseJson json;
+  json.set("currentBeacon", nearestBeacon);
+  json.set("lastUpdated", timestamp);
+
+  Firebase.RTDB.setJSON(
+    &fbdo,
+    "users/" + String(USER_UID) + "/liveTracking",
+    &json
+  );
+}
+
+// ====================================================
+// SETUP
+// ====================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  connectWiFi();
+  initTime();
+  initFirebase();
+  initMPU();
+
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+
+  Serial.println("🚀 Wearable Ready");
+}
+
+// ====================================================
+// LOOP
+// ====================================================
+void loop() {
+
+  unsigned long currentMillis = millis();
+  unsigned long long timestamp =
+      (unsigned long long)time(nullptr) * 1000ULL;
+
+  // 🔥 FAST FALL LOOP
+  if (currentMillis - lastMPURead >= MPU_INTERVAL) {
+    lastMPURead = currentMillis;
+    detectFall(timestamp);
+  }
+
+  // 🔥 BLE LOOP
+  if (currentMillis - lastBLEScan >= BLE_INTERVAL) {
+
+    lastBLEScan = currentMillis;
+
+    scanBeacons();
+
+    if (nearestBeacon != "" && Firebase.ready()) {
+      updateLiveTracking(timestamp);
+    }
+  }
+}
